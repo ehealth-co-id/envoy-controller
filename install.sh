@@ -85,4 +85,42 @@ rm -rf "$TMP_DIR"
 
 # 4. Systemd Setup
 echo "[*] Configuring systemd service..."
-cat > "$SERVICE_FILE"
+
+cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Envoy EDS Health Controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${NODE_BIN} ${INSTALL_DIR}/main.js
+WorkingDirectory=${INSTALL_DIR}
+
+# Reliability
+Restart=always
+RestartSec=2
+TimeoutStartSec=10
+
+# Hardening (minimal but meaningful)
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "[*] Reloading systemd"
+systemctl daemon-reload
+
+echo "[*] Enabling and starting service"
+systemctl enable ${SERVICE_NAME}
+systemctl restart ${SERVICE_NAME}
+
+echo "[✓] Done"
+echo "    status:  systemctl status ${SERVICE_NAME}"
+echo "    logs:    journalctl -u ${SERVICE_NAME} -f"
