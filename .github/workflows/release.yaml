@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*' # Triggers on tags like v1.0.0, v1.2.3
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to create releases
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Package Application
+        run: |
+          # Write to /tmp to avoid "file changed as we read it" error
+          tar -czvf /tmp/envoy-controller.tar.gz \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='node_modules' \
+            --exclude='.env' \
+            --exclude='*.md' \
+            .
+          
+          # Move the completed tarball back to the workspace
+          mv /tmp/envoy-controller.tar.gz ./
+
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: envoy-controller.tar.gz
