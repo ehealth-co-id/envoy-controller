@@ -3,27 +3,68 @@ set -euo pipefail
 
 echo "[*] Installing Envoy Proxy (latest release)..."
 
-# 1. Get latest release tag using GitHub's redirect trick (no jq required)
-LATEST_TAG=$(curl -sIL https://github.com/envoyproxy/envoy/releases/latest | grep -i '^location:' | sed 's/.*tag\///' | tr -d '\r\n')
-if [[ -z "$LATEST_TAG" ]]; then
-    echo "ERROR: Could not determine latest Envoy version."
-    exit 1
+# Check for Node.js (required to query GitHub API reliably)
+if [[ ! -x "/usr/bin/node" ]]; then
+  echo "ERROR: Node.js is required to fetch the latest Envoy release."
+  exit 1
 fi
-echo "[*] Latest Envoy version: $LATEST_TAG"
 
-# 2. Download binary
-# We try envoy-contrib first (as you specified), and fallback to standard envoy if it doesn't exist for this release
-DOWNLOAD_URL="https://github.com/envoyproxy/envoy/releases/download/${LATEST_TAG}/envoy-contrib-${LATEST_TAG}-linux-x86_64"
-HTTP_STATUS=$(curl -sIL -o /dev/null -w "%{http_code}" "$DOWNLOAD_URL")
+# 1. Fetch latest release asset URL using Node.js (100% reliable)
+echo "[*] Fetching latest Envoy release information..."
+DOWNLOAD_URL=$(node -e "
+  const https = require('https');
+  const opts = {
+    hostname: 'api.github.com',
+    path: '/repos/envoyproxy/envoy/releases/latest',
+    headers: { 'User-Agent': 'node.js' }
+  };
+  https.get(opts, (res) => {
+    let data = '';
+    res.on('data', (chunk) => data += chunk);
+    res.on('end', () => {
+      try {
+        const release = JSON.parse(data);
+        // Prefer envoy-contrib, fallback to standard envoy
+        let asset = release.assets.find(a => a.name.includes('envoy-contrib') && a.name.includes('linux-x86_64'));
+        if (!asset) {
+          asset = release.assets.find(a => a.name.startsWith('envoy-') && a.name.includes('linux-x86_64') && !a.name.includes('contrib') && !a.name.includes('debug'));
+        }
+        if (asset) {
+          console.log(asset.browser_download_url);
+        } else {
+          console.error('No suitable Envoy binary found in latest release.');
+          process.exit(1);
+        }
+      } catch (e) {
+        console.error('Failed to parse release JSON:', e.message);
+        process.exit(1);
+      }
+    });
+  }).on('error', (e) => {
+    console.error('Request failed:', e.message);
+    process.exit(1);
+  });
+")
 
-if [[ "$HTTP_STATUS" != "200" && "$HTTP_STATUS" != "302" ]]; then
-    echo "[!] envoy-contrib not found (HTTP $HTTP_STATUS), falling back to standard envoy binary..."
-    DOWNLOAD_URL="https://github.com/envoyproxy/envoy/releases/download/${LATEST_TAG}/envoy-${LATEST_TAG}-linux-x86_64"
+if [[ -z "$DOWNLOAD_URL" ]]; then
+    echo "ERROR: Could not determine download URL."
+    exit 1
 fi
 
 echo "[*] Downloading from: $DOWNLOAD_URL"
 curl -sSL "$DOWNLOAD_URL" -o /usr/local/bin/envoy
 chmod +x /usr/local/bin/envoy
+
+# 2. Sanity Check: Verify it's actually an ELF binary (magic number: 7f454c46)
+MAGIC=$(od -An -N 4 -tx1 /usr/local/bin/envoy | tr -d ' \n')
+if [[ "$MAGIC" != "7f454c46" ]]; then
+    echo "ERROR: Downloaded file is not a valid ELF binary. It might be a 404 page."
+    echo "First 100 bytes of downloaded file:"
+    head -c 100 /usr/local/bin/envoy
+    echo ""
+    rm -f /usr/local/bin/envoy
+    exit 1
+fi
 
 # 3. Setup configuration
 echo "[*] Configuring Envoy..."
@@ -43,7 +84,6 @@ admin:
       port_value: 9901
 static_resources:
   listeners:
-    # HTTP listener
     - name: listener_http
       address:
         socket_address:
@@ -56,7 +96,6 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
                 stat_prefix: tcp_http
                 cluster: app_http
-    # HTTPS listener (TLS passthrough)
     - name: listener_https
       address:
         socket_address:
@@ -70,7 +109,6 @@ static_resources:
                 stat_prefix: tcp_https
                 cluster: app_https
   clusters:
-    # HTTP cluster, file-based EDS
     - name: app_http
       connect_timeout: 2s
       type: EDS
@@ -92,7 +130,6 @@ static_resources:
             max_connections: 1000
             max_pending_requests: 500
             max_requests: 300
-    # HTTPS cluster, file-based EDS
     - name: app_https
       connect_timeout: 2s
       type: EDS
@@ -120,7 +157,7 @@ static_resources:
           "@type": type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer
 EOF
 
-# Create initial empty EDS files so Envoy doesn't crash on startup before controller updates them
+# Create initial empty EDS files so Envoy doesn't crash on startup
 for cluster in app_http app_https; do
   if [[ ! -f "/etc/envoy/eds/${cluster}.json" ]]; then
     cat <<EDS_EOF > "/etc/envoy/eds/${cluster}.json"
